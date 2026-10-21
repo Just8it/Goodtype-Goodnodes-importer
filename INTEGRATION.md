@@ -32,7 +32,7 @@ No user-side package installation or runtime network operation occurs.
 `goodtype-goodnotes-import.exe --version --json` returns:
 
 ```json
-{"name":"goodtype-goodnotes-import","version":"0.1.0","protocolVersion":1,"notebookSchemaVersion":3,"decoderCommit":"66028455fd7fc61b7931679915d811a25485e3ad"}
+{"name":"goodtype-goodnotes-import","version":"0.1.1","protocolVersion":1,"notebookSchemaVersion":3,"decoderCommit":"66028455fd7fc61b7931679915d811a25485e3ad"}
 ```
 
 `--check` runs the pinned decoder check under the existing process limits and prints its Python,
@@ -41,6 +41,27 @@ partial batch failure while preserving completed notebooks. A new destination's
 `import-report.json` starts with `pending` entries and records `completed`/`failed`, source,
 target, page count and any error. Each completed notebook has a detailed page report and its
 original export. Human-readable stdout progress is not a stable machine event stream.
+
+Version 0.1.1 maps supported source shapes to canonical editable lines, rectangles, ellipses and
+splines. Cubic controls are retained; quadratic segments convert exactly to cubic handles.
+Rotated ellipses keep their centre and convert source radians to canonical degrees. Unsupported
+styles/geometry stay explicit artwork: custom dash patterns, arrows, translucent fills, multiple
+subpaths and paths beyond the 256-knot limit are never silently simplified. Some arrow SVGs
+remain rejected by the existing strict SVG boundary; this release does not claim arrow support.
+
+Each fallback SVG has its own cropped viewBox and matching canonical x/y/width/height, including
+stroke/curve bounds and image cropping/rotation. Compatible marks within 12 points may merge,
+up to 180 points per axis and 128 source objects per group. A single large source object stays
+large. Marks may cross intervening artwork only when their padded bounds are disjoint; native
+ink/shapes and ordinary images are ordering barriers. Cropped images remain separate. Grouping
+therefore preserves the existing decoded paint order and does not join an entire page through
+a chain of nearby marks. Bounds are conservative, so some whitespace around curves is retained.
+
+Per-page notebook reports add `editable_shapes`; each `derived` entry includes its placement and
+`source_count`. Rust verifies that native objects plus these counts account for every decoded
+source object. Internal disposable decoder JSON is version 2 and must come from the same bundle;
+the public CLI protocol remains 1 and canonical notebook schema remains 3. Existing imported
+notebooks are unchanged; these improvements apply to new conversions into fresh folders.
 
 For a future GUI, Rust should own the selected input/destination paths and the verified fixed
 executable, run it in the background, read the bounded result report, and validate the generated
@@ -54,6 +75,15 @@ Rust-owned HTTPS path to the fixed GitHub release and necessary asset redirect h
 size/path/link limits, verify integrity, then atomically activate a new version directory. Keep
 the prior installation on failure. No GitHub/Goodnotes account or notebook upload is needed.
 No arbitrary latest-version download at startup. Windows packages are currently unsigned.
+
+An explicit update check may fetch the fixed latest-release `importer-update.json`. Its exact
+bytes must pass Ed25519 verification using the app-pinned key corresponding to
+`release-public-key.pem`; fetch `importer-update.json.sig` from that descriptor's exact version,
+never mix independently resolved latest assets. The protected publisher signs metadata after
+verification. Validate compatibility, stable version, clean source and the exact repository asset
+URL before downloading. This authenticates updates independently of mutable release checksums;
+Windows executable/Authenticode signing is still separate. Keep a working installation offline,
+refuse downgrades and retain it on any failed check or installation.
 
 ## Maintenance
 

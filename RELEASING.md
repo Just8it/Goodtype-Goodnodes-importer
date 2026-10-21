@@ -58,8 +58,17 @@ to publish a version. Normal users download fixed Release assets without a GitHu
 
 ## Goodtype download policy
 
-The app should download a tested, compatible release version and verify its app-pinned hash.
-It must not execute branch source, arbitrary `latest` binaries or development artifacts.
+The app can bootstrap from a tested package hash pinned in its source. Explicit update checks
+fetch `importer-update.json` from the latest stable release and verify its detached Ed25519
+signature (`importer-update.json.sig`) with the app-pinned public key before trusting the package
+URL/hash. Reject incompatible protocol/schema/target, dirty builds, prereleases and downgrades.
+Do not execute branch source, unsigned latest binaries or development artifacts.
+
+`release-public-key.pem` is the public verification key. Its private counterpart is the repository
+Actions secret `IMPORTER_SIGNING_KEY`; it is available only to the successful protected-main
+publisher job. `scripts/sign_release.py` signs the exact descriptor bytes using OpenSSL and
+verifies against the checked-in public key before publication. No private key enters an artifact.
+Rotating this key requires a coordinated Goodtype update; do not replace it as routine maintenance.
 An installed compatible importer continues working offline; a bad new release can be replaced
 by selecting the prior known-good version, without changing any imported notebook. A published
 release mistake is fixed with a new version, not by silently changing old bytes.
