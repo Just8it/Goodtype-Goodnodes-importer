@@ -7,8 +7,8 @@ use std::{
 
 use goodtype_core::{
     InkLayer, InkLayerReference, NotebookManifest, ObjectFields, Page, PageBackground,
-    PageDefaults, PageGeometry, PageObject, PageReference, SCHEMA_VERSION, Stroke, StrokePattern,
-    StrokePoint, StrokeTool, Transform, layout, paths, storage,
+    PageDefaults, PageGeometry, PageObject, PageReference, SCHEMA_VERSION, ShapeGeometry,
+    ShapeStyle, Stroke, StrokePattern, StrokePoint, StrokeTool, Transform, layout, paths, storage,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -38,6 +38,7 @@ pub struct DecodedPage {
     pub pdf_page: u32,
     pub ink: Vec<DecodedStroke>,
     pub images: Vec<DecodedImage>,
+    pub shapes: Vec<DecodedShape>,
     pub derived: Vec<Derived>,
     pub warnings: Vec<String>,
     pub source_uuid: String,
@@ -69,11 +70,26 @@ pub struct DecodedImage {
     pub z: i32,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecodedShape {
+    pub x: f64,
+    pub y: f64,
+    pub rotation: f64,
+    pub z: i32,
+    pub geometry: ShapeGeometry,
+    pub style: ShapeStyle,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Derived {
     pub file: String,
     pub z: i32,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
     pub reason: String,
     pub source_count: usize,
 }
@@ -86,6 +102,7 @@ pub struct PageReport {
     pub source_shapes: usize,
     pub source_images: usize,
     pub editable_strokes: usize,
+    pub editable_shapes: usize,
     pub points: usize,
     pub original_images: usize,
     pub derived: Vec<Derived>,
@@ -162,7 +179,7 @@ pub fn convert(
     }
     let decoded_root = paths::canonical_root(decoded_root)?;
     let decoded: Decoded = read_json(&decoded_root.join("decoded.json"), MIB)?;
-    if decoded.version != 1
+    if decoded.version != 2
         || decoded.decoder != DECODER_PIN
         || !matches!(decoded.schema.as_str(), "0818" | "081f")
         || decoded.pages.is_empty()
@@ -188,11 +205,29 @@ pub fn convert(
                 index+1, page.derived.iter().map(|v| v.reason.as_str()).collect::<Vec<_>>().join(", ")).into());
         }
         if page.ink.len() > 20_000
-            || page.images.len() + page.derived.len() > 10_000
+            || page.images.len() + page.derived.len() + page.shapes.len() > 10_000
             || page.ink.iter().map(|s| s.points.len()).sum::<usize>() > 750_000
             || page.source_uuid.len() > 128
+            || page.source_strokes > 20_000
+            || page.source_shapes > 10_000
+            || page.source_images > 10_000
+            || page
+                .derived
+                .iter()
+                .any(|art| !(1..=128).contains(&art.source_count))
         {
             return Err("decoded page exceeds content limits".into());
+        }
+        let imported_count = page.ink.len()
+            + page.shapes.len()
+            + page.images.len()
+            + page
+                .derived
+                .iter()
+                .map(|art| art.source_count)
+                .sum::<usize>();
+        if imported_count != page.source_strokes + page.source_shapes + page.source_images {
+            return Err("decoded page does not account for every source object".into());
         }
         let geometry = PageGeometry {
             width_pt: page.width,
@@ -313,6 +348,29 @@ pub fn convert(
         }];
         current.page.objects.clear();
         current.page.reading_order.clear();
+        for shape in &page.shapes {
+            shape.geometry.validate()?;
+            shape.style.validate()?;
+            let number = current.page.objects.len();
+            let id = layout::object_id(&page_id, number + 1);
+            current.page.reading_order.push(id.clone());
+            current.page.objects.push(PageObject::Shape {
+                fields: ObjectFields {
+                    id,
+                    x: shape.x,
+                    y: shape.y,
+                    rotation: shape.rotation,
+                    scale: 1.,
+                    z_index: shape.z,
+                    reading_order: number as u32,
+                    group_id: None,
+                    created_at: timestamp.clone(),
+                    modified_at: timestamp.clone(),
+                },
+                geometry: shape.geometry.clone(),
+                style: shape.style.clone(),
+            });
+        }
         for image in &page.images {
             let bytes = read_limited(
                 &scratch_file(&decoded_root, &image.file)?,
@@ -337,10 +395,10 @@ pub fn convert(
             let path = storage::store_pasted_image(destination, &artwork.file, &bytes)?;
             let image = DecodedImage {
                 file: artwork.file.clone(),
-                x: 0.,
-                y: 0.,
-                width: page.width,
-                height: page.height,
+                x: artwork.x,
+                y: artwork.y,
+                width: artwork.width,
+                height: artwork.height,
                 z: artwork.z,
             };
             add_image(
@@ -363,6 +421,7 @@ pub fn convert(
             source_shapes: page.source_shapes,
             source_images: page.source_images,
             editable_strokes: page.ink.len(),
+            editable_shapes: page.shapes.len(),
             points: page.ink.iter().map(|s| s.points.len()).sum(),
             original_images: page.images.len(),
             derived: page.derived,

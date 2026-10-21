@@ -26,12 +26,13 @@ and imported notebooks stay usable if you remove it.
 
 > [!WARNING]
 > **The Goodnotes decoder is experimental. Keep your original exports and review the result.**
-> Ordinary supported handwriting stays editable. Newer outline ink, dashed ink, shapes and
-> cropped images use vector artwork with `--allow-derived`, which reduces editability.
+> Supported handwriting and shapes stay editable. Outline/dashed ink, shapes outside Goodtype's
+> model and cropped images use bounded vector artwork with `--allow-derived`.
 > Text, sticky notes, audio, PDF stickers and partial erasure are not supported yet.
 
 Each notebook keeps its source export in `originals/` and includes an import report with
 page counts, artwork fallbacks and warnings. Existing destination folders are never replaced.
+Nearby fallback marks share small vector objects; distant marks stay independently selectable.
 
 ## Use
 
