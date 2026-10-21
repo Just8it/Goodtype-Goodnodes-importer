@@ -1,0 +1,22 @@
+<!--
+  Goodtype mark — for dark backgrounds.
+
+  A page standing on a base, with one handwritten stroke above two lines of set type. Teal is
+  only ever the handwritten part; ink-grey is only ever set type. Never tint the page outline,
+  the base, or the set lines teal — that colour rule is the whole idea of the mark, and the
+  product follows it too: teal means "your hand" wherever it appears.
+
+  The base was dropped once for reading like a keyboard beneath a screen, which made the mark
+  look like a PC rather than a notebook. It is back by decision: it is what the page stands on,
+  it gives the silhouette a foot to sit on, and without it the page floats.
+
+  Clear space on all sides equals the page's corner radius.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 80" fill="none" role="img" aria-label="Goodtype">
+  <rect x="14" y="4" width="92" height="58" rx="7" stroke="#E9EBEE" stroke-width="6"/>
+  <rect x="4" y="66" width="112" height="10" rx="5" fill="#E9EBEE"/>
+  <path d="M26 34 C 32 22, 38 22, 42 32 C 45 39, 49 39, 53 30 C 56 23, 61 23, 65 28 C 68 32, 72 32, 75 27"
+        stroke="#38B6C6" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="26" y="44" width="52" height="5.5" rx="2.75" fill="#E9EBEE"/>
+  <rect x="26" y="52" width="38" height="5.5" rx="2.75" fill="#8A929C"/>
+</svg>

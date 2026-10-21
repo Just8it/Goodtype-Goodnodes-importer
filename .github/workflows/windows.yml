@@ -1,0 +1,91 @@
+name: Windows
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  verify-and-package:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14.8'
+      - name: Install development decoder
+        run: |
+          python -m venv .venv
+          .venv/Scripts/python.exe -m pip install --no-deps -r requirements.txt
+      - name: Verify
+        run: cargo xtask verify
+      - name: Package
+        run: .venv/Scripts/python.exe scripts/build_windows.py
+      - name: Test extracted portable bundle
+        shell: pwsh
+        run: |
+          $archive = (Get-ChildItem dist/*.zip).FullName
+          $runtime = (Get-ChildItem dist/*/runtime/python.exe).FullName
+          & $runtime -I scripts/test_bundle.py $archive
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item RELEASE_NOTES.md dist/RELEASE_NOTES.md
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-x64
+          path: |
+            dist/*.zip
+            dist/*.json
+            dist/SHA256SUMS
+            dist/RELEASE_NOTES.md
+          if-no-files-found: error
+
+  release:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: verify-and-package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: stable-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-x64
+          path: dist
+      - name: Publish new version from main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          manifest = json.loads(next(pathlib.Path('dist').glob('*.json')).read_text())
+          assert manifest['sourceCommit'] == os.environ['GITHUB_SHA']
+          assert not manifest['sourceDirty']
+          tag = 'v' + manifest['version']
+          repo = os.environ['GITHUB_REPOSITORY']
+          existing = subprocess.run(['gh','api',f'repos/{repo}/git/ref/tags/{tag}'], capture_output=True)
+          if existing.returncode == 0:
+              print(f'{tag} already exists; published versions are never replaced. Bump Cargo.toml to release another version.')
+          else:
+              # Refuse to turn a network/auth failure into a guessed missing version.
+              if b'404' not in existing.stderr:
+                  raise RuntimeError(existing.stderr.decode())
+              assets = [str(p) for pattern in ('*.zip','*.json','SHA256SUMS') for p in pathlib.Path('dist').glob(pattern)]
+              args = ['gh','release','create',tag,*assets,'--repo',repo,'--target',os.environ['GITHUB_SHA'],
+                      '--title',f'Goodtype Goodnotes Importer {tag}','--notes-file','dist/RELEASE_NOTES.md']
+              if '-' in manifest['version']:
+                  args.append('--prerelease')
+              subprocess.run(args,check=True)
+          PY
