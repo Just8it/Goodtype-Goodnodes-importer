@@ -1,0 +1,28 @@
+[package]
+name = "goodtype-goodnotes-import"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+default-run = "goodtype-goodnotes-import"
+repository = "https://github.com/Just8it/Goodtype-Goodnodes-importer"
+description = "Local Goodnotes notebook and backup conversion into ordinary Goodtype notebooks"
+rust-version = "1.97.1"
+
+# Independent of the Goodtype desktop build and its dependency lockfile.
+[workspace]
+
+[dependencies]
+goodtype-core = { git = "https://github.com/Just8it/Goodtype.git", rev = "a670ba21375065da1e0a0826b28760c2d19623fc" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+tempfile = "3"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+time = { version = "0.3", features = ["formatting"] }
+roxmltree = "0.21"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }

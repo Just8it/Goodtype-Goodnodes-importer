@@ -1,0 +1,8 @@
+/target/
+/dist/
+/.venv/
+__pycache__/
+*.pyc
+*.log
+# Personal material never belongs in this repository.
+*.goodnotes

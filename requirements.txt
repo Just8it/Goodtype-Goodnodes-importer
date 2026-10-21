@@ -1,0 +1,3 @@
+# Install with --no-deps: the upstream rendering extras are not used or licensed here.
+goodnotes-document-parser @ git+https://github.com/Kaih1825/parser-for-goodnotes.git@66028455fd7fc61b7931679915d811a25485e3ad
+pypdf==6.21.1
