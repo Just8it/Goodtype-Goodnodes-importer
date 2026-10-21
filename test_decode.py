@@ -2,6 +2,7 @@
 import importlib.util
 import io
 import json
+import math
 from pathlib import Path
 import stat
 import struct
@@ -10,6 +11,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
+import xml.etree.ElementTree as ET
 
 TOOL = Path(__file__).resolve().parent
 
@@ -126,6 +128,100 @@ def synthetic_notebook():
         archive.writestr("notes/"+page, b"")
         archive.writestr("attachments/"+attachment, pdf.getvalue())
     return stream.getvalue()
+
+
+class GeometryTests(unittest.TestCase):
+    def rendered(self, **kwargs):
+        from goodnotes_re import page_to_svg
+        from goodnotes_re.page import Page, PageDimensions
+        from goodnotes_re.shape import ShapePath
+        shape = ShapePath(record_index=0, uuid="synthetic", points=((10., 20.), (110., 20.)),
+                          stroke_width=2., field_numbers=(1,), is_filled=False, **kwargs)
+        page = Page(index=0, uuid="page", member_path="notes/page", dimensions=PageDimensions(600, 800), shapes=[shape])
+        return shape, page_to_svg(page, None)
+
+    def test_native_line_has_local_geometry_without_smoothing(self):
+        shape, svg = self.rendered()
+        result = decode.native_shape(shape, svg)
+        self.assertEqual(result["geometry"]["kind"], "line")
+        self.assertAlmostEqual(result["x"], round(10*decode.SCALE, 2))
+        self.assertEqual(result["geometry"]["start"], {"x": 0., "y": 0.})
+        self.assertAlmostEqual(result["geometry"]["end"]["x"], round(110*decode.SCALE, 2)-round(10*decode.SCALE, 2))
+
+    def test_curves_keep_exact_cubic_and_quadratic_controls(self):
+        result = decode.path_geometry("M 10 20 C 12 25 25 28 30 30 Q 40 50 60 60")
+        self.assertEqual(result["kind"], "spline")
+        nodes = result["nodes"]
+        self.assertEqual(nodes[0]["handleOut"], {"x": 2., "y": 5.})
+        self.assertEqual(nodes[1]["handleIn"], {"x": -5., "y": -2.})
+        self.assertAlmostEqual(nodes[1]["handleOut"]["x"], 20/3)
+        self.assertAlmostEqual(nodes[2]["handleIn"]["y"], -20/3)
+        self.assertIsNone(decode.path_geometry("M 0 0 L 1 1 M 2 2 L 3 3"))
+        self.assertIsNone(decode.path_geometry("M 0 0 L 0 0"))
+        self.assertIsNone(decode.path_geometry("M 0 0 A 1 1 0 0 0 2 2"))
+        with self.assertRaises(ValueError):
+            decode.path_geometry("M 0 0 L 1e999 2")
+
+    def test_closed_and_rounded_paths_keep_the_closing_handle(self):
+        result = decode.path_geometry("M 0 0 L 20 0 L 20 20 Q 10 30 0 0 Z")
+        self.assertEqual(len(result["nodes"]), 3)
+        self.assertTrue(result["closed"])
+        self.assertAlmostEqual(result["nodes"][0]["handleIn"]["x"], 20/3)
+
+    def test_rotated_ellipse_retains_centre_and_uses_degrees(self):
+        shape, svg = self.rendered(shape_type="ellipse", cx=100., cy=200., rx=40., ry=20., rotation=math.pi/2)
+        result = decode.native_shape(shape, svg)
+        self.assertEqual(result["rotation"], 90.)
+        g = result["geometry"]
+        self.assertAlmostEqual(result["x"]-g["heightPt"]/2, round(100*decode.SCALE, 2))
+        self.assertAlmostEqual(result["y"]+g["widthPt"]/2, round(200*decode.SCALE, 2))
+
+    def test_unrepresentable_style_stays_vector_artwork(self):
+        for kwargs in ({"start_arrow": 1}, {"dash_pattern": (4., 5.)}):
+            shape, svg = self.rendered(**kwargs)
+            self.assertIsNone(decode.native_shape(shape, svg))
+        shape, svg = self.rendered()
+        self.assertIsNone(decode.native_shape(shape, svg.replace('fill="none"', 'fill="#000000" fill-opacity="0.3"')))
+
+    def test_vector_bounds_include_controls_stroke_and_image_crop(self):
+        svg = '<svg xmlns="http://www.w3.org/2000/svg" width="600" height="800"><path d="M 10 20 C -5 0 40 80 50 20" stroke="#000000" stroke-width="4"/></svg>'
+        box = decode.svg_bounds(svg)
+        self.assertLess(box[0], -5)
+        self.assertGreater(box[3], 80)
+        cropped = '<svg xmlns="http://www.w3.org/2000/svg"><g transform="rotate(90 20 30)"><svg x="10" y="10" width="20" height="40" overflow="hidden"><image x="-100" y="-100" width="1000" height="1000"/></svg></g></svg>'
+        box = decode.svg_bounds(cropped)
+        self.assertEqual(box, (-1., 19., 41., 41.))
+        data, placement = decode.crop_artwork([(svg, decode.svg_bounds(svg))], 600, 800)
+        root = ET.fromstring(data)
+        self.assertEqual(float(root.get("width")), placement[2])
+        self.assertLess(placement[2], 100)
+        self.assertLess(placement[3], 100)
+        self.assertEqual(len(root), 1)
+
+    def test_clustering_joins_neighbours_and_limits_chains(self):
+        group = [("a", (10, 10, 20, 20))]
+        self.assertTrue(decode.nearby_artwork(group, (24, 15, 30, 25)))
+        self.assertFalse(decode.nearby_artwork(group, (200, 400, 220, 450)))
+        group.append(("b", (15, 170, 25, 185)))
+        self.assertFalse(decode.nearby_artwork(group, (15, 188, 25, 200)))
+
+    def test_arc_bounds_allow_svg_radius_expansion(self):
+        box = decode.svg_bounds('<svg><path d="M 0 0 A 1 1 0 0 1 100 0"/></svg>')
+        self.assertLessEqual(box[1], -50)
+        self.assertGreaterEqual(box[3], 50)
+        with self.assertRaises(ValueError):
+            decode.svg_bounds('<svg><path d="M 0 0 A 2 1 0 0 1 100 0"/></svg>')
+
+    def test_clustering_merges_spatial_neighbours_without_reordering_overlaps(self):
+        fragments = [("left", (0, 0, 10, 10)), ("right", (200, 0, 210, 10)),
+                     ("left-again", (12, 0, 20, 10))]
+        groups = decode.cluster_artwork(fragments)
+        self.assertEqual([[name for name, _ in group] for group in groups], [["left", "left-again"], ["right"]])
+        # The last mark is closer to the first but crosses the long intervening mark.
+        fragments = [("first", (0, 0, 10, 10)), ("middle", (10, 0, 200, 10)),
+                     ("last", (9, 0, 12, 10))]
+        groups = decode.cluster_artwork(fragments)
+        self.assertEqual([[name for name, _ in group] for group in groups], [["first"], ["middle"], ["last"]])
 
 
 class PipelineTests(unittest.TestCase):

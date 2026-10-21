@@ -5,12 +5,14 @@ from dataclasses import replace
 import hashlib
 import io
 import json
+import math
 import re
 from pathlib import Path
 import stat
 import struct
 import sys
 import zipfile
+import xml.etree.ElementTree as ET
 
 PIN = "66028455fd7fc61b7931679915d811a25485e3ad"
 MIB = 1024 * 1024
@@ -18,6 +20,267 @@ MAX_MEMBER = 128 * MIB
 MAX_ARCHIVE = 512 * MIB
 MAX_FRAME = 16 * MIB
 SCALE = 72 / 132
+SVG_NS = "http://www.w3.org/2000/svg"
+NUMBER = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
+ET.register_namespace("", SVG_NS)
+
+
+def path_commands(data):
+    """Only the absolute commands emitted by the pinned renderer, with bounded numbers."""
+    tokens = re.findall(r"[MLCQAZ]|" + NUMBER, data)
+    if re.sub(r"[MLCQAZ]|" + NUMBER + r"|[\s,]", "", data):
+        raise ValueError("unsupported generated SVG path")
+    counts = {"M": 2, "L": 2, "C": 6, "Q": 4, "A": 7, "Z": 0}
+    commands = []
+    i = 0
+    while i < len(tokens):
+        op = tokens[i]
+        count = counts.get(op)
+        if count is None or i + count >= len(tokens):
+            raise ValueError("incomplete generated SVG path")
+        args = tuple(float(v) for v in tokens[i+1:i+1+count])
+        if any(not math.isfinite(v) or abs(v) > 10_000_000 for v in args):
+            raise ValueError("generated SVG coordinate exceeds bounds")
+        commands.append((op, args))
+        i += count + 1
+    return commands
+
+
+def path_geometry(data):
+    """Convert line/quadratic/cubic paths to existing knots; never fit or smooth them."""
+    nodes = []
+    closed = False
+    for op, args in path_commands(data):
+        if op == "M":
+            if nodes:
+                return None  # Multiple subpaths cannot share one canonical spline.
+            nodes.append({"point": {"x": args[0], "y": args[1]}, "handleIn": None, "handleOut": None})
+        elif op in ("L", "Q", "C") and nodes and not closed:
+            end = {"x": args[-2], "y": args[-1]}
+            incoming = None
+            if op != "L":
+                start = nodes[-1]["point"]
+                if op == "Q":
+                    c1 = [start[k] + 2/3*(args[n]-start[k]) for n, k in enumerate(("x", "y"))]
+                    c2 = [end[k] + 2/3*(args[n]-end[k]) for n, k in enumerate(("x", "y"))]
+                else:
+                    c1, c2 = args[:2], args[2:4]
+                nodes[-1]["handleOut"] = {k: c1[n]-start[k] for n, k in enumerate(("x", "y"))}
+                incoming = {k: c2[n]-end[k] for n, k in enumerate(("x", "y"))}
+            nodes.append({"point": end, "handleIn": incoming, "handleOut": None})
+        elif op == "Z" and nodes:
+            closed = True
+        else:
+            return None
+    if closed and len(nodes) > 1 and nodes[0]["point"] == nodes[-1]["point"]:
+        nodes[0]["handleIn"] = nodes.pop()["handleIn"]
+    if not 2 + int(closed) <= len(nodes) <= 256:
+        return None
+    if len(nodes) == 2 and not closed and not any(n["handleIn"] or n["handleOut"] for n in nodes):
+        if nodes[0]["point"] == nodes[1]["point"]:
+            return None
+        return {"kind": "line", "start": nodes[0]["point"], "end": nodes[1]["point"]}
+    return {"kind": "spline", "nodes": nodes, "closed": closed}
+
+
+def native_shape(shape, svg):
+    """Only promote geometry whose appearance the canonical shape can represent."""
+    if shape.start_arrow or shape.end_arrow or shape.dash_pattern:
+        return None
+    root = ET.fromstring(svg)
+    elements = list(root)
+    if len(elements) != 1:
+        return None
+    element = elements[0]
+    tag = element.tag.rsplit("}", 1)[-1]
+    x = y = rotation = 0.
+    filled = element.get("fill", "none") != "none"
+    opacity = float(element.get("stroke-opacity", "1"))
+    if filled and (float(element.get("fill-opacity", "1")) != 1 or opacity != 1):
+        return None  # Separate fill/outline alpha composites differently from object opacity.
+    style = {"strokeColor": shape.color_hex, "strokeWidthPt": float(element.get("stroke-width", "1")),
+             "fillColor": shape.color_hex if filled else None, "opacity": opacity}
+    if tag == "ellipse":
+        width, height = 2*float(element.get("rx")), 2*float(element.get("ry"))
+        rotation = shape.rotation
+        # Object rotation is about its local origin; retain the source ellipse centre.
+        c, s = math.cos(rotation), math.sin(rotation)
+        x = float(element.get("cx")) - c*width/2 + s*height/2
+        y = float(element.get("cy")) - s*width/2 - c*height/2
+        geometry = {"kind": "ellipse", "widthPt": width, "heightPt": height}
+    elif tag == "rect":
+        x, y = float(element.get("x", "0")), float(element.get("y", "0"))
+        geometry = {"kind": "rectangle", "widthPt": float(element.get("width")),
+                    "heightPt": float(element.get("height")), "cornerRadiusPt": float(element.get("rx", "0"))}
+    elif tag == "line":
+        geometry = {"kind": "line", "start": {"x": float(element.get("x1")), "y": float(element.get("y1"))},
+                    "end": {"x": float(element.get("x2")), "y": float(element.get("y2"))}}
+        if geometry["start"] == geometry["end"]:
+            return None
+    elif tag == "path":
+        geometry = path_geometry(element.get("d", ""))
+        if geometry is None:
+            return None
+    else:
+        return None
+    if geometry["kind"] in ("rectangle", "ellipse"):
+        if not all(0 < geometry[k] <= 14_400 for k in ("widthPt", "heightPt")):
+            return None
+    else:
+        points = ([geometry["start"], geometry["end"]] if geometry["kind"] == "line"
+                  else [n["point"] for n in geometry["nodes"]])
+        x, y = min(p["x"] for p in points), min(p["y"] for p in points)
+        for point in points:
+            point["x"] -= x
+            point["y"] -= y
+    return {"x": x, "y": y, "rotation": math.degrees(rotation), "geometry": geometry, "style": style}
+
+
+def union_bounds(boxes):
+    boxes = [b for b in boxes if b is not None]
+    if not boxes:
+        return None
+    return (min(b[0] for b in boxes), min(b[1] for b in boxes),
+            max(b[2] for b in boxes), max(b[3] for b in boxes))
+
+
+def multiply(a, b):
+    return (a[0]*b[0]+a[2]*b[1], a[1]*b[0]+a[3]*b[1],
+            a[0]*b[2]+a[2]*b[3], a[1]*b[2]+a[3]*b[3],
+            a[0]*b[4]+a[2]*b[5]+a[4], a[1]*b[4]+a[3]*b[5]+a[5])
+
+
+def transform_matrix(value):
+    result = (1., 0., 0., 1., 0., 0.)
+    for match in re.finditer(r"(translate|rotate|scale|matrix)\s*\(([^)]*)\)", value):
+        name, raw = match.groups()
+        args = [float(v) for v in re.findall(NUMBER, raw)]
+        if name == "translate" and len(args) in (1, 2):
+            matrix = (1, 0, 0, 1, args[0], args[1] if len(args) == 2 else 0)
+        elif name == "scale" and len(args) in (1, 2):
+            matrix = (args[0], 0, 0, args[-1], 0, 0)
+        elif name == "rotate" and len(args) in (1, 3):
+            angle = math.radians(args[0])
+            c, s = math.cos(angle), math.sin(angle)
+            x, y = args[1:] if len(args) == 3 else (0, 0)
+            matrix = (c, s, -s, c, x-c*x+s*y, y-s*x-c*y)
+        elif name == "matrix" and len(args) == 6:
+            matrix = tuple(args)
+        else:
+            raise ValueError("unsupported generated SVG transform")
+        result = multiply(result, matrix)
+    if re.sub(r"(translate|rotate|scale|matrix)\s*\([^)]*\)|[\s,]", "", value):
+        raise ValueError("unsupported generated SVG transform")
+    return result
+
+
+def svg_bounds(svg):
+    """Conservative vector bounds, including curve control hulls, strokes and cropped images."""
+    def visit(node, parent, inherited_width=0):
+        tag = node.tag.rsplit("}", 1)[-1]
+        matrix = multiply(parent, transform_matrix(node.get("transform", "")))
+        width = float(node.get("stroke-width", inherited_width))
+        if tag == "g":
+            return union_bounds(visit(child, matrix, width) for child in node)
+        if tag == "defs":
+            return None
+        n = lambda key, default=0: float(node.get(key, default))
+        points = []
+        if tag in ("rect", "image", "svg"):
+            x, y, w, h = n("x"), n("y"), n("width"), n("height")
+            points = [(x, y), (x+w, y), (x+w, y+h), (x, y+h)]
+        elif tag in ("ellipse", "circle"):
+            x, y = n("cx"), n("cy")
+            rx, ry = (n("r"), n("r")) if tag == "circle" else (n("rx"), n("ry"))
+            points = [(x-rx, y-ry), (x+rx, y-ry), (x+rx, y+ry), (x-rx, y+ry)]
+        elif tag == "line":
+            points = [(n("x1"), n("y1")), (n("x2"), n("y2"))]
+        elif tag in ("polygon", "polyline"):
+            values = [float(v) for v in re.findall(NUMBER, node.get("points", ""))]
+            points = list(zip(values[::2], values[1::2]))
+        elif tag == "path":
+            current = start = None
+            for op, args in path_commands(node.get("d", "")):
+                if op == "A":
+                    rx, ry, angle, _, _, x, y = args
+                    if current is None or abs(rx-ry) > .00001 or angle != 0:
+                        raise ValueError("unverified generated elliptical arc")
+                    # SVG expands a too-small circle to half its endpoint distance.
+                    radius = 2*max(abs(rx), math.hypot(x-current[0], y-current[1])/2)
+                    points.extend([(x-radius, y-radius), (x+radius, y+radius)])
+                    current = (x, y)
+                else:
+                    points.extend(zip(args[::2], args[1::2]))
+                    if args:
+                        current = args[-2:]
+                    if op == "M":
+                        start = current
+                    elif op == "Z":
+                        current = start
+        else:
+            raise ValueError(f"cannot bound generated SVG element: {tag}")
+        if not points:
+            return None
+        a, b, c, d, e, f = matrix
+        points = [(a*x+c*y+e, b*x+d*y+f) for x, y in points]
+        # One extra point covers the renderer's two-decimal rounding and antialiasing edge.
+        padding = 1 + width*math.hypot(a, b, c, d)/2
+        if node.get("marker-start") or node.get("marker-end"):
+            padding += 12*width
+        box = (min(x for x, _ in points)-padding, min(y for _, y in points)-padding,
+               max(x for x, _ in points)+padding, max(y for _, y in points)+padding)
+        if any(not math.isfinite(v) or abs(v) > 10_000_000 for v in box):
+            raise ValueError("generated SVG bounds exceed coordinate limits")
+        return box
+
+    root = ET.fromstring(svg)
+    box = union_bounds(visit(child, (1, 0, 0, 1, 0, 0)) for child in root)
+    if box is None:
+        raise ValueError("generated artwork has no bounded geometry")
+    return box
+
+
+def crop_artwork(fragments, page_width, page_height):
+    bounds = union_bounds(box for _, box in fragments)
+    x, y, right, bottom = max(0., bounds[0]), max(0., bounds[1]), min(page_width, bounds[2]), min(page_height, bounds[3])
+    if right <= x or bottom <= y:
+        # Retain wholly off-page objects rather than silently discarding their source count.
+        x, y, right, bottom = bounds
+    width, height = right-x, bottom-y
+    root = ET.Element(f"{{{SVG_NS}}}svg", {"width": str(width), "height": str(height),
+                          "viewBox": f"{x} {y} {width} {height}"})
+    for svg, _ in fragments:
+        root.extend(ET.fromstring(svg))
+    return ET.tostring(root, encoding="utf8"), (x, y, width, height)
+
+
+def nearby_artwork(group, box):
+    """Cap extent to stop page-spanning chains of nearby marks."""
+    bounds = union_bounds([b for _, b in group] + [box])
+    if len(group) >= 128 or bounds[2]-bounds[0] > 180 or bounds[3]-bounds[1] > 180:
+        return False
+    return any(math.hypot(max(0, b[0]-box[2], box[0]-b[2]),
+                          max(0, b[1]-box[3], box[1]-b[3])) <= 12 for _, b in group)
+
+
+def cluster_artwork(fragments):
+    """Move a mark into a nearby earlier group only across disjoint intervening artwork."""
+    groups = []
+    for fragment in fragments:
+        box = fragment[1]
+        for index in range(len(groups)-1, -1, -1):
+            group = groups[index]
+            if not nearby_artwork(group, box):
+                continue
+            intervening = (b for other in groups[index+1:] for _, b in other)
+            if any(box[0] <= b[2] and b[0] <= box[2] and box[1] <= b[3] and b[1] <= box[3]
+                   for b in intervening):
+                continue
+            group.append(fragment)
+            break
+        else:
+            groups.append([fragment])
+    return groups
 
 
 def checked_members(archive):
@@ -257,16 +520,45 @@ def decode(source, output):
                     background_attachment_path=None)
         ink = []
         images = []
+        shapes = []
         derived = []
+        pending = []
+        pending_reason = ""
+        pending_bytes = 0
 
-        def artwork(strokes=(), shapes=(), image_elements=(), reason=""):
+        def next_z():
+            return len(ink)+len(images)+len(shapes)+len(derived)
+
+        def render(strokes=(), shapes=(), image_elements=()):
             view = replace(p, strokes=list(strokes), shapes=list(shapes), image_elements=tuple(image_elements),
                            elements=(), sticky_notes=(), text_fragments=[], text_elements=())
             svg = page_to_svg(view, doc)
-            filename = f"page-{p.index+1:04}-derived-{len(derived):04}.svg"
-            emit(filename, svg.encode("utf8"), 20*MIB)
-            derived.append({"file": filename, "z": len(ink)+len(images)+len(derived),
-                            "reason": reason, "source_count": len(strokes)+len(shapes)+len(image_elements)})
+            if len(svg.encode("utf8")) > 20*MIB:
+                raise ValueError("individual vector artwork exceeds byte limit")
+            return svg
+
+        def flush_artwork():
+            nonlocal pending_bytes
+            if not pending:
+                return
+            for group in cluster_artwork(pending):
+                data, (x, y, w, h) = crop_artwork(group, width, height)
+                filename = f"page-{p.index+1:04}-derived-{len(derived):04}.svg"
+                emit(filename, data, 20*MIB)
+                derived.append({"file": filename, "z": next_z(), "x": x, "y": y, "width": w, "height": h,
+                                "reason": pending_reason, "source_count": len(group)})
+            pending.clear()
+            pending_bytes = 0
+
+        def artwork(svg, reason):
+            nonlocal pending_reason, pending_bytes
+            box = svg_bounds(svg)
+            size = len(svg.encode("utf8"))
+            if pending and (reason != pending_reason or pending_bytes+size > 20*MIB):
+                flush_artwork()
+            pending_reason = reason
+            pending.append((svg, box))
+            pending_bytes += size
 
         for image in p.image_elements:
             member = "attachments/" + image.attachment_uuid
@@ -276,53 +568,58 @@ def decode(source, output):
             cropped = image.orig_width > 0 and image.orig_height > 0 and (
                 abs(image.width-image.orig_width) > .1 or abs(image.height-image.orig_height) > .1)
             if cropped or abs(image.rotation_rad) > .00001:
-                artwork(image_elements=[image], reason="cropped/rotated image")
+                # Images remain individually selectable, even when their rectangles overlap.
+                flush_artwork()
+                artwork(render(image_elements=[image]), "cropped/rotated image")
+                flush_artwork()
             else:
+                flush_artwork()
                 images.append({"file": filename, "x": image.x*SCALE, "y": image.y*SCALE,
                                "width": image.width*SCALE, "height": image.height*SCALE,
-                               "z": len(ink)+len(images)+len(derived)})
-        native_run = []
-
-        def flush_native():
-            if native_run:
-                artwork(strokes=native_run, reason="native outline ink")
-                native_run.clear()
+                               "z": next_z()})
 
         for s in p.strokes:
             if s.eraser_cuts or s.is_cut_start or s.is_cut_end:
                 raise ValueError(f"page {p.index+1}: partially erased ink needs fidelity validation")
             if s.dash_pattern:
-                flush_native()
-                artwork(strokes=[s], reason="dashed ink")
+                artwork(render(strokes=[s]), "dashed ink")
                 continue
             if s.native_cgpaths or s.outline_polygons or s.ribbon_path:
-                native_run.append(s)
+                artwork(render(strokes=[s]), "native outline ink")
                 continue
-            flush_native()
             radii = [pt.pressure*SCALE for pt in s.points]
             widths = [2*r if r > 0 else s.width*SCALE for r in radii]
             if not widths or min(widths) <= 0 or max(widths) > 4*min(widths):
-                artwork(strokes=[s], reason="ink width outside native pressure range")
+                artwork(render(strokes=[s]), "ink width outside native pressure range")
                 continue
+            flush_artwork()
             nominal = max(widths)
             pressure = max(widths)-min(widths) > .000001
             ink.append({"color": s.color_hex, "opacity": s.alpha, "width": nominal,
                         "highlighter": s.is_highlighter, "pressure": pressure,
-                        "z": len(ink)+len(images)+len(derived),
+                        "z": next_z(),
                         "points": [[pt.x*SCALE, pt.y*SCALE, (w/nominal-.25)/.75 if pressure else 1]
                                    for pt, w in zip(s.points, widths)]})
-        flush_native()
-        if p.shapes:
-            artwork(shapes=p.shapes, reason="recognized vector shapes")
+        flush_artwork()
+        for shape in p.shapes:
+            svg = render(shapes=[shape])
+            native = native_shape(shape, svg)
+            if native is None:
+                artwork(svg, "shape geometry/style outside native model")
+            else:
+                flush_artwork()
+                native["z"] = next_z()
+                shapes.append(native)
+        flush_artwork()
         data = {"width": width, "height": height, "background": background,
-                "pdf_page": p.pdf_page_index, "ink": ink, "images": images,
+                "pdf_page": p.pdf_page_index, "ink": ink, "images": images, "shapes": shapes,
                 "derived": derived, "warnings": warnings, "source_uuid": p.uuid,
                 "source_strokes": len(p.strokes), "source_shapes": len(p.shapes),
                 "source_images": len(p.image_elements)}
         filename = f"page-{p.index+1:04}.json"
         emit(filename, json.dumps(data, allow_nan=False, separators=(",", ":")).encode("utf8"), 64*MIB)
         pages.append(filename)
-        print(f"Decoded page {p.index+1}: {len(ink)} editable strokes, {len(derived)} vector groups", flush=True)
+        print(f"Decoded page {p.index+1}: {len(ink)} editable strokes, {len(shapes)} editable shapes, {len(derived)} vector groups", flush=True)
         # The upstream assembler retains Page objects; release the large geometry now.
         return replace(p, strokes=[], shapes=[], image_elements=(), elements=(), text_fragments=[])
 
@@ -349,7 +646,7 @@ def decode(source, output):
                 data = doc.read(member)
                 if not data.startswith((b"%PDF", b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff")):
                     raise ValueError(f"unsupported attachment (possibly audio): {member}")
-    result = {"version": 1, "decoder": PIN, "schema": schema, "pages": pages,
+    result = {"version": 2, "decoder": PIN, "schema": schema, "pages": pages,
               "warnings": ["Experimental source decoder; mixed-object stacking and source fidelity require visual review."]}
     emit("decoded.json", json.dumps(result).encode("utf8"), MIB)
 
