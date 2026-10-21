@@ -60,17 +60,24 @@ jobs:
       group: stable-publish
       cancel-in-progress: false
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: windows-x64
           path: dist
+      - name: Sign update metadata
+        env:
+          IMPORTER_SIGNING_KEY: ${{ secrets.IMPORTER_SIGNING_KEY }}
+        run: python3 scripts/sign_release.py
       - name: Publish new version from main
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 - <<'PY'
           import json, os, pathlib, subprocess
-          manifest = json.loads(next(pathlib.Path('dist').glob('*.json')).read_text())
+          manifest = json.loads(next(pathlib.Path('dist').glob('goodtype-goodnotes-importer-*.json')).read_text())
           assert manifest['sourceCommit'] == os.environ['GITHUB_SHA']
           assert not manifest['sourceDirty']
           tag = 'v' + manifest['version']
@@ -82,7 +89,7 @@ jobs:
               # Refuse to turn a network/auth failure into a guessed missing version.
               if b'404' not in existing.stderr:
                   raise RuntimeError(existing.stderr.decode())
-              assets = [str(p) for pattern in ('*.zip','*.json','SHA256SUMS') for p in pathlib.Path('dist').glob(pattern)]
+              assets = [str(p) for pattern in ('*.zip','*.json','*.sig','SHA256SUMS') for p in pathlib.Path('dist').glob(pattern)]
               args = ['gh','release','create',tag,*assets,'--repo',repo,'--target',os.environ['GITHUB_SHA'],
                       '--title',f'Goodtype Goodnotes Importer {tag}','--notes-file','dist/RELEASE_NOTES.md']
               if '-' in manifest['version']:

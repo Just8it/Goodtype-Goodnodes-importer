@@ -1,6 +1,7 @@
 """Build-boundary regression checks; no network or private notebook data."""
 import importlib.util
 import os
+import json
 from pathlib import Path
 import tempfile
 import tomllib
@@ -11,9 +12,32 @@ import zipfile
 spec = importlib.util.spec_from_file_location("builder", Path(__file__).with_name("build_windows.py"))
 builder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(builder)
+sign_spec = importlib.util.spec_from_file_location("signer", Path(__file__).with_name("sign_release.py"))
+signer = importlib.util.module_from_spec(sign_spec)
+sign_spec.loader.exec_module(signer)
 
 
 class BuildTests(unittest.TestCase):
+    def test_signing_rejects_dirty_or_unrelated_publishing_commits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            descriptor = root/"goodtype-goodnotes-importer-0.1.1-windows-x64.json"
+            for dirty, commit in [(True, "expected"), (False, "other")]:
+                descriptor.write_text(json.dumps({"sourceDirty":dirty,"sourceCommit":commit}))
+                with patch.dict(os.environ, {"GITHUB_SHA":"expected"}), self.assertRaises(ValueError):
+                    signer.sign(root, root/"public.pem", "private test placeholder")
+                self.assertFalse((root/"importer-update.json").exists())
+
+    def test_failed_signing_leaves_no_publishable_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/"goodtype-goodnotes-importer-0.1.1-windows-x64.json").write_text(json.dumps({"sourceDirty":False,"sourceCommit":"expected"}))
+            with patch.dict(os.environ, {"GITHUB_SHA":"expected"}), patch.object(signer.subprocess, "run", side_effect=RuntimeError("signer unavailable")):
+                with self.assertRaises(RuntimeError):
+                    signer.sign(root, root/"public.pem", "private test placeholder")
+            self.assertFalse((root/"importer-update.json").exists())
+            self.assertFalse((root/"importer-update.json.sig").exists())
+
     def test_publication_waits_out_a_brief_windows_file_lock(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory)/"source"

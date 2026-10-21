@@ -76,6 +76,15 @@ size/path/link limits, verify integrity, then atomically activate a new version 
 the prior installation on failure. No GitHub/Goodnotes account or notebook upload is needed.
 No arbitrary latest-version download at startup. Windows packages are currently unsigned.
 
+An explicit update check may fetch the fixed latest-release `importer-update.json`. Its exact
+bytes must pass Ed25519 verification using the app-pinned key corresponding to
+`release-public-key.pem`; fetch `importer-update.json.sig` from that descriptor's exact version,
+never mix independently resolved latest assets. The protected publisher signs metadata after
+verification. Validate compatibility, stable version, clean source and the exact repository asset
+URL before downloading. This authenticates updates independently of mutable release checksums;
+Windows executable/Authenticode signing is still separate. Keep a working installation offline,
+refuse downgrades and retain it on any failed check or installation.
+
 ## Maintenance
 
 The canonical writer is `goodtype-core` from a pinned Goodtype Git revision. Upgrade that pin
